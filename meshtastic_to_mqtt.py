@@ -73,6 +73,7 @@ class MeshtasticMQTTGateway:
         pub.subscribe(self._on_user, "meshtastic.receive.user")
         pub.subscribe(self._on_data, "meshtastic.receive.data")
         pub.subscribe(self._on_position, "meshtastic.receive.position")
+        pub.subscribe(self._on_node_updated, "meshtastic.node.updated")
 
         self._inactivity_thread = threading.Thread(
             target=self._monitor_inactivity, name="inactivity-watchdog", daemon=True
@@ -124,25 +125,32 @@ class MeshtasticMQTTGateway:
 
         decoded = packet.get("decoded", {})
         telemetry = decoded.get("telemetry") or decoded.get("deviceMetrics")
-        if isinstance(telemetry, dict):
-            voltage = telemetry.get("voltage") or telemetry.get("batteryVoltage")
-            battery = telemetry.get("batteryLevel") or telemetry.get("battery_percent")
-            if voltage is not None:
-                self._publish_value(node_id, "voltage_v", voltage)
-                self._set_alert(node_id, "low_voltage", voltage < 3.5, f"Voltage {voltage} V")
-            if battery is not None:
-                self._publish_value(node_id, "battery_pct", battery)
-
+        self._publish_telemetry(node_id, telemetry)
         position = decoded.get("position")
-        if isinstance(position, dict):
-            lat = position.get("latitude")
-            lon = position.get("longitude")
-            alt = position.get("altitude")
-            if lat is not None and lon is not None:
-                self._publish_value(node_id, "latitude", lat)
-                self._publish_value(node_id, "longitude", lon)
-            if alt is not None:
-                self._publish_value(node_id, "altitude_m", alt)
+        self._publish_position(node_id, position)
+
+    def _publish_telemetry(self, node_id: str, telemetry: Optional[Dict[str, Any]]) -> None:
+        if not isinstance(telemetry, dict):
+            return
+        voltage = telemetry.get("voltage") or telemetry.get("batteryVoltage")
+        battery = telemetry.get("batteryLevel") or telemetry.get("battery_percent")
+        if voltage is not None:
+            self._publish_value(node_id, "voltage_v", voltage)
+            self._set_alert(node_id, "low_voltage", voltage < 3.5, f"Voltage {voltage} V")
+        if battery is not None:
+            self._publish_value(node_id, "battery_pct", battery)
+
+    def _publish_position(self, node_id: str, position: Optional[Dict[str, Any]]) -> None:
+        if not isinstance(position, dict):
+            return
+        lat = position.get("latitude")
+        lon = position.get("longitude")
+        alt = position.get("altitude")
+        if lat is not None and lon is not None:
+            self._publish_value(node_id, "latitude", lat)
+            self._publish_value(node_id, "longitude", lon)
+        if alt is not None:
+            self._publish_value(node_id, "altitude_m", alt)
 
     def _sanitize_node_id(self, node_id: Optional[str]) -> str:
         if not node_id:
@@ -155,13 +163,13 @@ class MeshtasticMQTTGateway:
 
     # --- Meshtastic event handlers -------------------------------------------------
 
-    def _on_receive(self, packet: Dict[str, Any]) -> None:
+    def _on_receive(self, packet: Dict[str, Any], interface: Optional[Any] = None) -> None:
         node_id = self._extract_node_id(packet)
         LOGGER.debug("Received packet from %s", node_id)
         self._record_seen(node_id)
         self._publish_packet_metrics(node_id, packet)
 
-    def _on_user(self, packet: Dict[str, Any]) -> None:
+    def _on_user(self, packet: Dict[str, Any], interface: Optional[Any] = None) -> None:
         node_id = self._extract_node_id(packet)
         user = packet.get("user", {})
         LOGGER.debug("User info update for %s: %s", node_id, user)
@@ -174,7 +182,7 @@ class MeshtasticMQTTGateway:
             if short_name:
                 self._publish_value(node_id, "short_name", short_name)
 
-    def _on_data(self, packet: Dict[str, Any]) -> None:
+    def _on_data(self, packet: Dict[str, Any], interface: Optional[Any] = None) -> None:
         node_id = self._extract_node_id(packet)
         LOGGER.debug("Data message from %s", node_id)
         self._record_seen(node_id)
@@ -183,7 +191,7 @@ class MeshtasticMQTTGateway:
         if payload is not None:
             self._publish_value(node_id, "payload_raw", payload)
 
-    def _on_position(self, packet: Dict[str, Any]) -> None:
+    def _on_position(self, packet: Dict[str, Any], interface: Optional[Any] = None) -> None:
         node_id = self._extract_node_id(packet)
         LOGGER.debug("Position update from %s", node_id)
         self._record_seen(node_id)
@@ -198,6 +206,24 @@ class MeshtasticMQTTGateway:
                 self._publish_value(node_id, "longitude", lon)
             if alt is not None:
                 self._publish_value(node_id, "altitude_m", alt)
+
+    def _on_node_updated(self, node: Dict[str, Any], interface: Optional[Any] = None) -> None:
+        user = node.get("user", {})
+        node_id_raw = user.get("id") or node.get("id")
+        if not node_id_raw and "num" in node:
+            node_id_raw = f"!{int(node['num']):08x}"
+        node_id = self._sanitize_node_id(node_id_raw)
+        LOGGER.debug("Node updated for %s: %s", node_id, node)
+        self._record_seen(node_id)
+        if user:
+            long_name = user.get("longName") or user.get("long_name")
+            short_name = user.get("shortName") or user.get("short_name")
+            if long_name:
+                self._publish_value(node_id, "long_name", long_name)
+            if short_name:
+                self._publish_value(node_id, "short_name", short_name)
+        self._publish_telemetry(node_id, node.get("deviceMetrics"))
+        self._publish_position(node_id, node.get("position"))
 
     # --- Inactivity monitoring -----------------------------------------------------
 
