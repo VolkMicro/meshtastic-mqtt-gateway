@@ -16,7 +16,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 import paho.mqtt.client as mqtt
 from meshtastic.serial_interface import SerialInterface
@@ -55,6 +55,9 @@ class MeshtasticMQTTGateway:
 
         self._last_seen: Dict[str, datetime] = {}
         self._alert_state: Dict[str, AlertState] = {}
+        self._device_meta_sent: Set[str] = set()
+        self._control_meta_sent: Dict[str, Set[str]] = {}
+        self._node_names: Dict[str, str] = {}
         self._stop_event = threading.Event()
 
         self.mqtt_client = mqtt.Client(client_id="meshtastic-mqtt-gateway")
@@ -99,6 +102,41 @@ class MeshtasticMQTTGateway:
         sanitized = "".join(result).strip("_")
         return sanitized or "value"
 
+    def _control_payload_type(self, value: Any) -> str:
+        if isinstance(value, bool):
+            return "switch"
+        if isinstance(value, (int, float)):
+            return "value"
+        return "text"
+
+    def _publish_device_meta(self, node_id: str, force: bool = False) -> None:
+        if not force and node_id in self._device_meta_sent:
+            return
+        title = self._node_names.get(node_id)
+        if not title:
+            title = node_id.replace("mesh_", "Meshtastic ").replace("_", " ").title()
+        payload = json.dumps({"name": title, "type": "virtual", "driver": "meshtastic"})
+        LOGGER.debug("Publishing device meta for %s => %s", node_id, payload)
+        self.mqtt_client.publish(f"/devices/{node_id}/meta", payload, retain=True)
+        self._device_meta_sent.add(node_id)
+        self._control_meta_sent.setdefault(node_id, set())
+
+    def _publish_control_meta(self, node_id: str, parameter: str, value: Any) -> None:
+        controls = self._control_meta_sent.setdefault(node_id, set())
+        if parameter in controls:
+            return
+        control_meta = {
+            "type": self._control_payload_type(value),
+            "readonly": True,
+            "name": parameter.replace("_", " ").title(),
+        }
+        payload = json.dumps(control_meta)
+        LOGGER.debug("Publishing control meta for %s.%s => %s", node_id, parameter, payload)
+        self.mqtt_client.publish(
+            f"/devices/{node_id}/controls/{parameter}/meta", payload, retain=True
+        )
+        controls.add(parameter)
+
     def _publish_value(self, node_id: str, parameter: str, value: Any) -> None:
         topic = MQTT_TOPIC_TEMPLATE.format(f"{node_id}_{parameter}")
         if isinstance(value, bytes):
@@ -110,6 +148,8 @@ class MeshtasticMQTTGateway:
                 payload = json.dumps(value)
             except TypeError:
                 payload = str(value)
+        self._publish_device_meta(node_id)
+        self._publish_control_meta(node_id, parameter, value)
         LOGGER.debug("Publishing %s => %s", topic, payload)
         self.mqtt_client.publish(topic, payload, retain=True)
 
@@ -118,7 +158,7 @@ class MeshtasticMQTTGateway:
         node_id: str,
         metrics: Dict[str, Any],
         prefix: str = "",
-        skip_keys: Optional[set[str]] = None,
+        skip_keys: Optional[Set[str]] = None,
     ) -> None:
         skip_keys = skip_keys or set()
         for key, value in metrics.items():
@@ -134,6 +174,7 @@ class MeshtasticMQTTGateway:
         now = datetime.utcnow()
         self._last_seen[node_id] = now
         self._alert_state.setdefault(node_id, AlertState())
+        self._node_names.setdefault(node_id, node_id.replace("mesh_", "Meshtastic ").strip())
 
     def _set_alert(self, node_id: str, alert_name: str, triggered: bool, detail: str) -> None:
         alert_state = self._alert_state.setdefault(node_id, AlertState())
@@ -160,11 +201,10 @@ class MeshtasticMQTTGateway:
 
         decoded = packet.get("decoded", {})
         telemetry_block = decoded.get("telemetry")
+        device_metrics = None
         if isinstance(telemetry_block, dict):
             self._publish_additional_telemetry(node_id, telemetry_block)
-        else:
-            telemetry_block = {}
-        device_metrics = telemetry_block.get("deviceMetrics") if isinstance(telemetry_block, dict) else None
+            device_metrics = telemetry_block.get("deviceMetrics")
         if not isinstance(device_metrics, dict):
             device_metrics = decoded.get("deviceMetrics")
         self._publish_telemetry(node_id, device_metrics)
@@ -213,14 +253,36 @@ class MeshtasticMQTTGateway:
         if alt is not None:
             self._publish_value(node_id, "altitude_m", alt)
 
-    def _sanitize_node_id(self, node_id: Optional[str]) -> str:
-        if not node_id:
-            return "unknown"
-        return node_id.strip().replace(" ", "_").replace("/", "_")
+    def _sanitize_node_id(self, node_id: Optional[str], node_num: Optional[int] = None) -> str:
+        if node_id:
+            base = node_id.lstrip("!").strip()
+        elif node_num is not None:
+            try:
+                base = f"{int(node_num):08x}"
+            except (TypeError, ValueError):
+                base = "unknown"
+        else:
+            base = "unknown"
+        base = base.lower()
+        safe = "".join(ch if ch.isalnum() else "_" for ch in base)
+        safe = safe.strip("_") or "unknown"
+        return f"mesh_{safe}"
 
     def _extract_node_id(self, packet: Dict[str, Any]) -> str:
-        raw_id = packet.get("fromId") or packet.get("nodeId") or packet.get("user", {}).get("id")
-        return self._sanitize_node_id(raw_id)
+        decoded = packet.get("decoded", {})
+        raw_id = (
+            packet.get("fromId")
+            or packet.get("nodeId")
+            or decoded.get("user", {}).get("id")
+            or packet.get("user", {}).get("id")
+        )
+        node_num = packet.get("from") or packet.get("num") or decoded.get("num") or packet.get("nodeNum")
+        if isinstance(node_num, str):
+            try:
+                node_num = int(node_num, 0)
+            except ValueError:
+                node_num = None
+        return self._sanitize_node_id(raw_id, node_num)
 
     # --- Meshtastic event handlers -------------------------------------------------
 
@@ -232,12 +294,17 @@ class MeshtasticMQTTGateway:
 
     def _on_user(self, packet: Dict[str, Any], interface: Optional[Any] = None) -> None:
         node_id = self._extract_node_id(packet)
-        user = packet.get("user", {})
+        decoded = packet.get("decoded", {})
+        user = decoded.get("user") or packet.get("user", {})
         LOGGER.debug("User info update for %s: %s", node_id, user)
         self._record_seen(node_id)
         if user:
             long_name = user.get("longName") or user.get("long_name")
             short_name = user.get("shortName") or user.get("short_name")
+            display_name = long_name or short_name or user.get("id")
+            if display_name:
+                self._node_names[node_id] = display_name
+                self._publish_device_meta(node_id, force=True)
             if long_name:
                 self._publish_value(node_id, "long_name", long_name)
             if short_name:
@@ -279,6 +346,10 @@ class MeshtasticMQTTGateway:
         if user:
             long_name = user.get("longName") or user.get("long_name")
             short_name = user.get("shortName") or user.get("short_name")
+            display_name = long_name or short_name or user.get("id")
+            if display_name:
+                self._node_names[node_id] = display_name
+                self._publish_device_meta(node_id, force=True)
             if long_name:
                 self._publish_value(node_id, "long_name", long_name)
             if short_name:
