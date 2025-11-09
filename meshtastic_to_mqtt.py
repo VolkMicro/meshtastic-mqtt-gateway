@@ -89,11 +89,46 @@ class MeshtasticMQTTGateway:
     def _on_mqtt_disconnect(self, client: mqtt.Client, userdata: Any, rc: int) -> None:
         LOGGER.warning("MQTT disconnected with code: %s", rc)
 
+    def _snakeify(self, text: str) -> str:
+        safe = "".join(ch if ch.isalnum() else "_" for ch in text)
+        result: list[str] = []
+        for index, ch in enumerate(safe):
+            if ch.isupper() and index > 0 and safe[index - 1].islower():
+                result.append("_")
+            result.append(ch.lower())
+        sanitized = "".join(result).strip("_")
+        return sanitized or "value"
+
     def _publish_value(self, node_id: str, parameter: str, value: Any) -> None:
         topic = MQTT_TOPIC_TEMPLATE.format(f"{node_id}_{parameter}")
-        payload = value if isinstance(value, (str, bytes)) else json.dumps(value)
+        if isinstance(value, bytes):
+            payload: Any = value
+        elif isinstance(value, (str, int, float, bool)):
+            payload = str(value)
+        else:
+            try:
+                payload = json.dumps(value)
+            except TypeError:
+                payload = str(value)
         LOGGER.debug("Publishing %s => %s", topic, payload)
         self.mqtt_client.publish(topic, payload, retain=True)
+
+    def _publish_metric_map(
+        self,
+        node_id: str,
+        metrics: Dict[str, Any],
+        prefix: str = "",
+        skip_keys: Optional[set[str]] = None,
+    ) -> None:
+        skip_keys = skip_keys or set()
+        for key, value in metrics.items():
+            if key in skip_keys or key == "raw":
+                continue
+            parameter = f"{prefix}{self._snakeify(key)}"
+            if isinstance(value, dict):
+                self._publish_metric_map(node_id, value, f"{parameter}_", skip_keys)
+            elif isinstance(value, (int, float, str, bool, bytes)):
+                self._publish_value(node_id, parameter, value)
 
     def _record_seen(self, node_id: str) -> None:
         now = datetime.utcnow()
@@ -124,8 +159,15 @@ class MeshtasticMQTTGateway:
             self._set_alert(node_id, "poor_snr", snr < 2.0, f"SNR {snr} dB")
 
         decoded = packet.get("decoded", {})
-        telemetry = decoded.get("telemetry") or decoded.get("deviceMetrics")
-        self._publish_telemetry(node_id, telemetry)
+        telemetry_block = decoded.get("telemetry")
+        if isinstance(telemetry_block, dict):
+            self._publish_additional_telemetry(node_id, telemetry_block)
+        else:
+            telemetry_block = {}
+        device_metrics = telemetry_block.get("deviceMetrics") if isinstance(telemetry_block, dict) else None
+        if not isinstance(device_metrics, dict):
+            device_metrics = decoded.get("deviceMetrics")
+        self._publish_telemetry(node_id, device_metrics)
         position = decoded.get("position")
         self._publish_position(node_id, position)
 
@@ -139,6 +181,25 @@ class MeshtasticMQTTGateway:
             self._set_alert(node_id, "low_voltage", voltage < 3.5, f"Voltage {voltage} V")
         if battery is not None:
             self._publish_value(node_id, "battery_pct", battery)
+        self._publish_metric_map(node_id, telemetry, prefix="device_metrics_")
+
+    def _publish_additional_telemetry(self, node_id: str, telemetry: Dict[str, Any]) -> None:
+        if not isinstance(telemetry, dict):
+            return
+        self._publish_metric_map(
+            node_id,
+            telemetry,
+            prefix="telemetry_",
+            skip_keys={"deviceMetrics", "localStats", "environmentMetrics", "powerMetrics"},
+        )
+        for section in ("deviceMetrics", "localStats", "environmentMetrics", "powerMetrics"):
+            section_data = telemetry.get(section)
+            if isinstance(section_data, dict):
+                self._publish_metric_map(
+                    node_id,
+                    section_data,
+                    prefix=f"{self._snakeify(section)}_",
+                )
 
     def _publish_position(self, node_id: str, position: Optional[Dict[str, Any]]) -> None:
         if not isinstance(position, dict):
@@ -224,6 +285,17 @@ class MeshtasticMQTTGateway:
                 self._publish_value(node_id, "short_name", short_name)
         self._publish_telemetry(node_id, node.get("deviceMetrics"))
         self._publish_position(node_id, node.get("position"))
+        telemetry = node.get("telemetry")
+        if isinstance(telemetry, dict):
+            self._publish_additional_telemetry(node_id, telemetry)
+        for section in ("localStats", "environmentMetrics", "powerMetrics"):
+            section_data = node.get(section)
+            if isinstance(section_data, dict):
+                self._publish_metric_map(
+                    node_id,
+                    section_data,
+                    prefix=f"{self._snakeify(section)}_",
+                )
 
     # --- Inactivity monitoring -----------------------------------------------------
 
