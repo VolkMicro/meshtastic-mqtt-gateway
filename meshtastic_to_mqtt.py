@@ -1,10 +1,10 @@
-"\"\"\"Meshtastic to MQTT gateway for Wiren Board.
+"""Meshtastic to MQTT gateway for Wiren Board.
 
 Connects to a Meshtastic device via serial, listens for telemetry/user data,
 and republishes the parsed values to a local MQTT broker using Wiren Board
 control topics. Includes simple alerting for low voltage, poor SNR, and node
 inactivity.
-\"\"\"
+"""
 
 from __future__ import annotations
 
@@ -263,4 +263,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
