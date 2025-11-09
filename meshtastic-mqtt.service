@@ -1,0 +1,17 @@
+[Unit]
+Description=Meshtastic to MQTT gateway
+After=network-online.target mosquitto.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wirenboard
+Group=wirenboard
+WorkingDirectory=/opt/meshtastic-mqtt-gateway
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/meshtastic-mqtt-gateway/meshtastic_to_mqtt.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
