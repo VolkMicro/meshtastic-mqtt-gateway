@@ -28,6 +28,20 @@ DEFAULT_SERIAL_PATH = "/dev/ttyACM0"
 DEFAULT_MQTT_HOST = "localhost"
 DEFAULT_MQTT_PORT = 1883
 MQTT_TOPIC_TEMPLATE = "/devices/meshtastic/controls/{}/on"
+ALIAS_MAP: Dict[str, list[str]] = {
+    "voltage_v": ["voltage"],
+    "battery_pct": ["battery"],
+    "altitude_m": ["alt"],
+    "latitude": ["lat"],
+    "longitude": ["lon"],
+    "long_name": ["name"],
+    "short_name": ["short"],
+    "snr_db": ["snr"],
+    "rssi_dbm": ["rssi"],
+    "hops_away": ["hops"],
+    "last_heard": [],
+    "telemetry_time": [],
+}
 
 
 @dataclass
@@ -137,7 +151,7 @@ class MeshtasticMQTTGateway:
         )
         controls.add(parameter)
 
-    def _publish_value(self, node_id: str, parameter: str, value: Any) -> None:
+    def _publish_value(self, node_id: str, parameter: str, value: Any, *, _skip_alias: bool = False) -> None:
         topic = MQTT_TOPIC_TEMPLATE.format(f"{node_id}_{parameter}")
         if isinstance(value, bytes):
             payload: Any = value
@@ -152,6 +166,9 @@ class MeshtasticMQTTGateway:
         self._publish_control_meta(node_id, parameter, value)
         LOGGER.debug("Publishing %s => %s", topic, payload)
         self.mqtt_client.publish(topic, payload, retain=True)
+        if not _skip_alias:
+            for alias in ALIAS_MAP.get(parameter, []):
+                self._publish_value(node_id, alias, value, _skip_alias=True)
 
     def _publish_metric_map(
         self,
@@ -175,6 +192,7 @@ class MeshtasticMQTTGateway:
         self._last_seen[node_id] = now
         self._alert_state.setdefault(node_id, AlertState())
         self._node_names.setdefault(node_id, node_id.replace("mesh_", "Meshtastic ").strip())
+        self._publish_value(node_id, "last_heard", now.isoformat(timespec="seconds") + "Z")
 
     def _set_alert(self, node_id: str, alert_name: str, triggered: bool, detail: str) -> None:
         alert_state = self._alert_state.setdefault(node_id, AlertState())
@@ -241,12 +259,38 @@ class MeshtasticMQTTGateway:
                     prefix=f"{self._snakeify(section)}_",
                 )
 
+    def _publish_node_overview(self, node_id: str, node: Dict[str, Any]) -> None:
+        skip = {
+            "user",
+            "position",
+            "deviceMetrics",
+            "telemetry",
+            "localStats",
+            "environmentMetrics",
+            "powerMetrics",
+            "raw",
+            "id",
+            "num",
+            "macaddr",
+            "hwModel",
+            "publicKey",
+        }
+        overview = {k: v for k, v in node.items() if k not in skip}
+        if overview:
+            self._publish_metric_map(node_id, overview)
+
     def _publish_position(self, node_id: str, position: Optional[Dict[str, Any]]) -> None:
         if not isinstance(position, dict):
             return
         lat = position.get("latitude")
         lon = position.get("longitude")
         alt = position.get("altitude")
+        lat_i = position.get("latitudeI")
+        lon_i = position.get("longitudeI")
+        if lat is None and lat_i is not None:
+            lat = float(lat_i) / 1e7
+        if lon is None and lon_i is not None:
+            lon = float(lon_i) / 1e7
         if lat is not None and lon is not None:
             self._publish_value(node_id, "latitude", lat)
             self._publish_value(node_id, "longitude", lon)
@@ -367,6 +411,7 @@ class MeshtasticMQTTGateway:
                     section_data,
                     prefix=f"{self._snakeify(section)}_",
                 )
+        self._publish_node_overview(node_id, node)
 
     # --- Inactivity monitoring -----------------------------------------------------
 
