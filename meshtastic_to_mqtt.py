@@ -161,16 +161,18 @@ class MeshtasticMQTTGateway:
         self._record_seen(node_id)
         self._publish_packet_metrics(node_id, packet)
 
-    def _on_user(self, user_info: Dict[str, Any]) -> None:
-        node_id = self._extract_node_id(user_info)
-        user = user_info.get("user", {})
+    def _on_user(self, packet: Dict[str, Any]) -> None:
+        node_id = self._extract_node_id(packet)
+        user = packet.get("user", {})
         LOGGER.debug("User info update for %s: %s", node_id, user)
         self._record_seen(node_id)
         if user:
-            if "longName" in user:
-                self._publish_value(node_id, "long_name", user["longName"])
-            if "shortName" in user:
-                self._publish_value(node_id, "short_name", user["shortName"])
+            long_name = user.get("longName") or user.get("long_name")
+            short_name = user.get("shortName") or user.get("short_name")
+            if long_name:
+                self._publish_value(node_id, "long_name", long_name)
+            if short_name:
+                self._publish_value(node_id, "short_name", short_name)
 
     def _on_data(self, packet: Dict[str, Any]) -> None:
         node_id = self._extract_node_id(packet)
